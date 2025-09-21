@@ -1,7 +1,7 @@
 # Dim-Predictor
 
 ### 1. Introduction
-This probleem was a part of the Amazon ML Challenge. The task is to predict the length of cardboard boxes using available product metadata such as title, bullet points, description, product type, and other attributes.
+This problem was a part of the Amazon ML Challenge. The task is to predict the length of cardboard boxes using available product metadata such as title, bullet points, description, product type, and other attributes.
 
 The core challenge was to extract dimensions from unstructured product descriptions, process them consistently, and then train robust models that generalize well to unseen products.
 
