@@ -20,8 +20,10 @@ from scripts.exceptions.exceptions import DIMException
 # General configurations
 #----------------------------------------------------------------------
 # Output File Path
-OUTPUT_FILE = 'extracted_data.csv'
-OUTPUT_PATH = os.path.join(os.getcwd(), 'data', OUTPUT_FILE)
+TRAIN_OUTPUT_FILE = 'extracted_data.csv'
+TRAIN_OUTPUT_PATH = os.path.join(os.getcwd(), 'data', TRAIN_OUTPUT_FILE)
+TEST_OUTPUT_FILE = 'test_extracted_data.csv'
+TEST_OUTPUT_PATH = os.path.join(os.getcwd(), 'data', TEST_OUTPUT_FILE)
 
 # For named dimensions
 width_pattern = re.compile(r'width[^a-zA-Z0-9]*(\d+(?:\.\d+)?)[\s"]*(inch|inches|in|cm|mm|feet|ft)?', re.IGNORECASE)
@@ -100,23 +102,31 @@ def assign_packaging_style(row):
         raise DIMException(f"Error assigning packaging style: {e}", sys)
 
 # Function to transform the data in chunks
-def transform_dimensions(chunks): 
+def transform_dimensions(chunks, is_train=True): 
     try: 
-        # Final df to store each transformed chunks
         final_df = pd.DataFrame()
 
         for chunk in chunks: 
             chunk['combined_text'] = chunk.apply(combine_text, axis=1) 
             chunk[['parsed_width', 'parsed_height']] = chunk['combined_text'].apply(extract_width_height) 
-            chunk.rename(columns={"PRODUCT_LENGTH": "parsed_length"}, inplace=True) 
 
-            chunk_filtered = chunk[['PRODUCT_TYPE_ID', 'TITLE', 'DESCRIPTION', 'parsed_length', 'parsed_width', 'parsed_height']].dropna() 
+            # If training data → keep PRODUCT_LENGTH
+            if is_train and "PRODUCT_LENGTH" in chunk.columns:
+                chunk.rename(columns={"PRODUCT_LENGTH": "parsed_length"}, inplace=True)
+            else:
+                # For test data → create dummy parsed_length column
+                chunk["parsed_length"] = np.nan
+
+            chunk_filtered = chunk[['PRODUCT_TYPE_ID', 'TITLE', 'DESCRIPTION', 
+                                    'parsed_length', 'parsed_width', 'parsed_height']].dropna(subset=["parsed_width","parsed_height"], how="all") 
+
             final_df = pd.concat([final_df, chunk_filtered], ignore_index=True)
 
         return final_df
     except Exception as e: 
         logging.error(f"Error during data transformation: {e}") 
         raise DIMException(f"Error during data transformation: {e}", sys)
+#----------------------------------------------------------------------
 
 # Function to count the frequerncy of packaging styles
 def count_product_type_freq(df, col):
@@ -132,27 +142,37 @@ def count_product_type_freq(df, col):
 # Function to scale the int and float dimensions to a 0-1 range
 def scale_dimensions(df, is_train=True, scaler_path="scaler.pkl"):
     try:
-        X = df[["TYPE_FREQ", "parsed_length", "parsed_width", "parsed_height", "PACKAGING_STYLE"]]
+        feature_cols = ["TYPE_FREQ", "parsed_length", "parsed_width", "parsed_height", "PACKAGING_STYLE"]
         SCALER_PATH = os.path.join(os.getcwd(), 'models', scaler_path)
 
+        X = df[feature_cols].copy()
+
         if is_train:
+            # Training mode: fit scaler
             scaler = MinMaxScaler()
-            X_scaled = scaler.fit_transform(X)
-            joblib.dump(scaler, SCALER_PATH)  # save fitted scaler
-            print(f"💾 Saved MinMaxScaler to {SCALER_PATH}")
+            X_scaled = scaler.fit_transform(X.fillna(0))   # fill NaN temporarily
+            joblib.dump(scaler, SCALER_PATH)
+            print(f"--> Saved MinMaxScaler to {SCALER_PATH}")
         else:
+            # Test mode: load scaler
             scaler = joblib.load(SCALER_PATH)
-            X_scaled = scaler.transform(X)
+            # Fill NaN with 0 before scaling
+            X_scaled = scaler.transform(X.fillna(0))
 
         # Replace scaled values in dataframe
         df_scaled = df.copy()
-        df_scaled[["TYPE_FREQ", "parsed_length", "parsed_width", "parsed_height", "PACKAGING_STYLE"]] = X_scaled
+        df_scaled[feature_cols] = X_scaled
+
+        # Restore NaN for parsed_length (since that's what we’re predicting)
+        if not is_train:
+            df_scaled.loc[df["parsed_length"].isna(), "parsed_length"] = np.nan
 
         return df_scaled
 
     except Exception as e:
         logging.error(f"Error scaling dimensions: {e}")
         raise DIMException(f"Error scaling dimensions: {e}", sys)
+
 #----------------------------------------------------------------------
 # Main function to execute the script
 #----------------------------------------------------------------------
@@ -166,31 +186,63 @@ def data_transformation(DATA_FILE, is_train):
         start_time = dt.datetime.now()
         chunks = pd.read_csv(DATA_PATH, chunksize=10000)
         extract_end_time = dt.datetime.now()
-        logging.info(f"Data extraction started at {start_time} and ended at {extract_end_time}. Processing chunks...")
+        logging.info(f"Data extraction started at {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                     f"and ended at {extract_end_time.strftime('%Y-%m-%d %H:%M:%S')}. Processing chunks...")
+        print(f"--> Data extraction started at {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
+              f"and ended at {extract_end_time.strftime('%Y-%m-%d %H:%M:%S')}. Processing chunks...")
 
         final_df = transform_dimensions(chunks)
         final_df["PACKAGING_STYLE"] = final_df.apply(assign_packaging_style, axis=1)
         
         final_df = count_product_type_freq(final_df, "PRODUCT_TYPE_ID")
-        logging.info(f"Product type frequency counted and added to the dataframe.")
-        
-        # Drop the columns title and description to keep only necessary columns
-        final_df = final_df[['TYPE_FREQ', 'parsed_length', 'parsed_width', 'parsed_height', 'PACKAGING_STYLE']]
+        logging.info("Product type frequency counted and added to the dataframe.")
+        print("--> Product type frequency counted and added to the dataframe.")
+
+        # Keep only necessary columns
+        cols_to_keep = ['TYPE_FREQ', 'parsed_width', 'parsed_height', 'PACKAGING_STYLE']
+        if "parsed_length" in final_df.columns:
+            cols_to_keep.insert(1, 'parsed_length')
+        final_df = final_df[cols_to_keep]
+
+        # ------------------------------------------------------------------
+        # Handle missing values before scaling
+        numeric_cols = ["TYPE_FREQ", "parsed_length", "parsed_width", "parsed_height"]
+        categorical_cols = ["PACKAGING_STYLE"]
+
+        for col in numeric_cols:
+            if col in final_df.columns:
+                if final_df[col].isnull().any():
+                    final_df[col] = final_df[col].fillna(final_df[col].median())
+
+
+        for col in categorical_cols:
+            if col in final_df.columns:
+                if final_df[col].isnull().any():
+                    final_df[col] = final_df[col].fillna(final_df[col].mode()[0])
+
+        # Final check — drop rows if still NaN
+        if final_df.isnull().any().any():
+            final_df = final_df.fillna(0)
+        # ------------------------------------------------------------------
 
         # Scale the dimensions
         final_df = scale_dimensions(final_df, is_train=is_train)
-        logging.info(f"Dimensions scaled using MinMaxScaler.")
+        logging.info("Dimensions scaled using MinMaxScaler.")
+        print("--> Dimensions scaled using MinMaxScaler.")
 
         end_time = dt.datetime.now()
-        logging.info(f"Data transformation completed. Total time taken: {(end_time - extract_end_time).total_seconds():.2f} seconds")
+        logging.info(f"Data transformation completed. Total time taken: "
+                     f"{(end_time - extract_end_time).total_seconds():.2f} seconds")
 
+        OUTPUT_PATH = TRAIN_OUTPUT_PATH if is_train else TEST_OUTPUT_PATH
         final_df.to_csv(OUTPUT_PATH, index=False)
         elapsed_time = dt.datetime.now() - start_time
         logging.info(f"Transformed data saved to {OUTPUT_PATH}. Elapsed time: {elapsed_time.total_seconds():.2f} seconds")
-        print(f"Data transformation completed in {elapsed_time.total_seconds():.2f} seconds.")
+        print(f"==> Data transformation completed in {elapsed_time.total_seconds():.2f} seconds.")
 
         return final_df
 
     except Exception as e:
         logging.error(f"Initialization error: {e}")
         raise DIMException(f"Initialization error: {e}", sys)
+
